@@ -1,78 +1,77 @@
 import os
+import json
 from multiprocessing import Process, Queue
-from pathlib import Path
+from tqdm import tqdm
 
 import cv2
-import numpy as np
 import torch
-from evo.core.trajectory import PoseTrajectory3D
-from evo.tools import file_interface
 
 from dpvo.config import cfg
 from dpvo.dpvo import DPVO
-from dpvo.plot_utils import plot_trajectory, save_output_for_COLMAP, save_ply
 from dpvo.stream import image_stream, video_stream
 from dpvo.utils import Timer
 
 SKIP = 0
 
-def show_image(image, t=0):
-    image = image.permute(1, 2, 0).cpu().numpy()
-    cv2.imshow('image', image / 255.0)
-    cv2.waitKey(t)
-
 @torch.no_grad()
-def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False):
-
-    slam = None
+def run(cfg, video_path, calib, stride=1, skip=0, timeit=False):
+    visual_odometry = None
     queue = Queue(maxsize=8)
 
-    if os.path.isdir(imagedir):
-        reader = Process(target=image_stream, args=(queue, imagedir, calib, stride, skip))
+    # Start the reader process first to get total frame count
+    if os.path.isdir(video_path):
+        # For image directory, count number of images
+        n_frames = len([f for f in os.listdir(video_path) if f.endswith(('.png', '.jpg', '.jpeg'))])
+        reader = Process(target=image_stream, args=(queue, video_path, calib, stride, skip))
     else:
-        reader = Process(target=video_stream, args=(queue, imagedir, calib, stride, skip))
+        # For video file, get frame count using cv2
+        cap = cv2.VideoCapture(video_path)
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        reader = Process(target=video_stream, args=(queue, video_path, calib, stride, skip))
 
     reader.start()
 
+    # Calculate actual number of frames after stride and skip
+    n_frames = (n_frames - skip) // stride
+
+    # Initialize progress bar
+    pbar = tqdm(total=n_frames, desc="Processing Visual Odometry", unit="frames")
+
     while 1:
         (t, image, intrinsics) = queue.get()
-        if t < 0: break
+        if t < 0:
+            pbar.close()
+            break
 
-        image = torch.from_numpy(image).permute(2,0,1).cuda()
+        image = torch.from_numpy(image).permute(2, 0, 1).cuda()
         intrinsics = torch.from_numpy(intrinsics).cuda()
 
-        if slam is None:
+        if visual_odometry is None:
             _, H, W = image.shape
-            slam = DPVO(cfg, network, ht=H, wd=W, viz=viz)
+            visual_odometry = DPVO(cfg, 'models/dpvo.pth', ht=H, wd=W)
 
-        with Timer("SLAM", enabled=timeit):
-            slam(t, image, intrinsics)
+        with Timer("VO", enabled=timeit):
+            visual_odometry(t, image, intrinsics)
+
+        # Update progress bar
+        pbar.update(1)
 
     reader.join()
-
-    points = slam.pg.points_.cpu().numpy()[:slam.m]
-    colors = slam.pg.colors_.view(-1, 3).cpu().numpy()[:slam.m]
-
-    return slam.terminate(), (points, colors, (*intrinsics, H, W))
-
+    return visual_odometry.terminate(), (*intrinsics, H, W)
 
 if __name__ == '__main__':
     import argparse
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--network', type=str, default='dpvo.pth')
-    parser.add_argument('--imagedir', type=str)
-    parser.add_argument('--calib', type=str)
-    parser.add_argument('--name', type=str, help='name your run', default='result')
-    parser.add_argument('--stride', type=int, default=2)
+    parser.add_argument('--video_path', type=str)
+    parser.add_argument('--calib', type=str, default='calib/iphone.txt')
+    parser.add_argument('--stride', type=int, default=1)
     parser.add_argument('--skip', type=int, default=0)
     parser.add_argument('--config', default="config/default.yaml")
     parser.add_argument('--timeit', action='store_true')
-    parser.add_argument('--viz', action="store_true")
-    parser.add_argument('--plot', action="store_true")
     parser.add_argument('--opts', nargs='+', default=[])
-    parser.add_argument('--save_ply', action="store_true")
-    parser.add_argument('--save_colmap', action="store_true")
-    parser.add_argument('--save_trajectory', action="store_true")
+
     args = parser.parse_args()
 
     cfg.merge_from_file(args.config)
@@ -81,23 +80,28 @@ if __name__ == '__main__':
     print("Running with config...")
     print(cfg)
 
-    (poses, tstamps), (points, colors, calib) = run(cfg, args.network, args.imagedir, args.calib, args.stride, args.skip, args.viz, args.timeit)
-    trajectory = PoseTrajectory3D(positions_xyz=poses[:,:3], orientations_quat_wxyz=poses[:, [6, 3, 4, 5]], timestamps=tstamps)
+    (poses, tstamps), calib = run(cfg, args.video_path, args.calib, args.stride, args.skip, args.timeit)
 
-    if args.save_ply:
-        save_ply(args.name, points, colors)
+    result = []
 
-    if args.save_colmap:
-        save_output_for_COLMAP(args.name, trajectory, points, colors, *calib)
+    # Iterate through all timestamps and collect the data
+    # The assumption is that the camera starts by pointing forward. Every frame is an absolute position and rotation
+    for i, timestamp in enumerate(tstamps):
+        # Append absolute position and quaternion data to the result list with 10 decimal precision
+        result.append([
+            round(float(poses[i][0]), 10),  # x
+            round(float(poses[i][1]), 10),  # y
+            round(float(poses[i][2]), 10),  # z
+            round(float(poses[i][3]), 10),  # q_x
+            round(float(poses[i][4]), 10),  # q_y
+            round(float(poses[i][5]), 10),  # q_z
+            round(float(poses[i][6]), 10)  # q_w
+        ])
 
-    if args.save_trajectory:
-        Path("saved_trajectories").mkdir(exist_ok=True)
-        file_interface.write_tum_trajectory_file(f"saved_trajectories/{args.name}.txt", trajectory)
+    # Create output JSON path by replacing .mp4 with _vo.json
+    json_path = args.video_path.rsplit('.', 1)[0] + '.vo.json'
 
-    if args.plot:
-        Path("trajectory_plots").mkdir(exist_ok=True)
-        plot_trajectory(trajectory, title=f"DPVO Trajectory Prediction for {args.name}", filename=f"trajectory_plots/{args.name}.pdf")
-
-
-        
-
+    # Convert the parsed data to JSON format
+    with open(json_path, 'w') as outfile:
+        json.dump(result, outfile, indent=4)
+    print(f"Results saved to {json_path}")

@@ -1,18 +1,11 @@
 import numpy as np
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from collections import OrderedDict
-
-import torch_scatter
-from torch_scatter import scatter_sum
 
 from . import fastba
 from . import altcorr
-from . import lietorch
 from .lietorch import SE3
 
-from .extractor import BasicEncoder, BasicEncoder4
+from .extractor import BasicEncoder4
 from .blocks import GradientClip, GatedResidual, SoftAgg
 
 from .utils import *
@@ -20,7 +13,6 @@ from .ba import BA
 from . import projective_ops as pops
 
 autocast = torch.cuda.amp.autocast
-import matplotlib.pyplot as plt
 
 DIM = 384
 
@@ -174,7 +166,7 @@ class CorrBlock:
 
 
 class VONet(nn.Module):
-    def __init__(self, use_viewer=False):
+    def __init__(self):
         super(VONet, self).__init__()
         self.P = 3
         self.patchify = Patchifier(self.P)

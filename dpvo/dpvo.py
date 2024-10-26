@@ -1,7 +1,5 @@
 import numpy as np
-import torch
 import torch.multiprocessing as mp
-import torch.nn.functional as F
 
 from . import altcorr, fastba, lietorch
 from . import projective_ops as pops
@@ -19,7 +17,7 @@ Id = SE3.Identity(1, device="cuda")
 
 class DPVO:
 
-    def __init__(self, cfg, network, ht=480, wd=640, viz=False):
+    def __init__(self, cfg, network, ht=480, wd=640):
         self.cfg = cfg
         self.load_weights(network)
         self.is_initialized = False
@@ -75,9 +73,6 @@ class DPVO:
         # feature pyramid
         self.pyramid = (self.fmap1_, self.fmap2_)
 
-        self.viewer = None
-        if viz:
-            self.start_viewer()
 
     def load_long_term_loop_closure(self):
         try:
@@ -110,18 +105,6 @@ class DPVO:
 
         self.network.cuda()
         self.network.eval()
-
-    def start_viewer(self):
-        from dpviewer import Viewer
-
-        intrinsics_ = torch.zeros(1, 4, dtype=torch.float32, device="cuda")
-
-        self.viewer = Viewer(
-            self.image_,
-            self.pg.poses_,
-            self.pg.points_,
-            self.pg.colors_,
-            intrinsics_)
 
     @property
     def poses(self):
@@ -191,8 +174,6 @@ class DPVO:
         poses = lietorch.stack(poses, dim=0)
         poses = poses.inv().data.cpu().numpy()
         tstamps = np.array(self.tlist, dtype=np.float64)
-        if self.viewer is not None:
-            self.viewer.join()
 
         # Poses: x y z qx qy qz qw
         return poses, tstamps
@@ -382,9 +363,6 @@ class DPVO:
 
         if (self.n+1) >= self.N:
             raise Exception(f'The buffer size is too small. You can increase it using "--opts BUFFER_SIZE={self.N*2}"')
-
-        if self.viewer is not None:
-            self.viewer.update_image(image.contiguous())
 
         image = 2 * (image[None,None] / 255.0) - 0.5
         
